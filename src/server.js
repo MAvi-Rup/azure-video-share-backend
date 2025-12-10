@@ -1,5 +1,4 @@
 // server.js
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -11,108 +10,67 @@ const crypto = require("crypto");
 const app = express();
 const port = process.env.PORT || 4000;
 
-// Middleware
+// ---------- Middleware ----------
 app.use(cors());
 app.use(express.json());
-app.use(express.static("public"));
 
-// File upload
+// Multer in-memory storage
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 50 * 1024 * 1024 },
+    limits: { fileSize: 200 * 1024 * 1024 } // 200 MB
 });
 
-// Azure Blob Storage
+// ---------- Blob Storage ----------
 const storageConnectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
 const blobContainerName = process.env.BLOB_CONTAINER_NAME || "videos";
-const blobServiceClient = BlobServiceClient.fromConnectionString(storageConnectionString);
+
+const blobServiceClient = BlobServiceClient.fromConnectionString(
+    storageConnectionString
+);
 const containerClient = blobServiceClient.getContainerClient(blobContainerName);
 
 async function ensureBlobContainer() {
-    try {
-        await containerClient.createIfNotExists();
-        console.log(`Blob container '${blobContainerName}' is ready`);
-    } catch (err) {
-        console.error("Error ensuring blob container:", err.message);
-    }
+    await containerClient.createIfNotExists();
 }
 
-// Cosmos DB Setup
-const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
-const cosmosKey = process.env.COSMOS_KEY;
+// ---------- Cosmos DB ----------
+const cosmosClient = new CosmosClient({
+    endpoint: process.env.COSMOS_ENDPOINT,
+    key: process.env.COSMOS_KEY
+});
+
 const cosmosDbName = process.env.COSMOS_DB_NAME || "video-db";
 const cosmosContainerName = process.env.COSMOS_CONTAINER_NAME || "videos";
-const cosmosClient = new CosmosClient({ endpoint: cosmosEndpoint, key: cosmosKey });
 
 const database = cosmosClient.database(cosmosDbName);
 const videosContainer = database.container(cosmosContainerName);
-const usersContainer = database.container("users"); // New container for user data
 
-// Helper functions
+// ---------- Helpers ----------
 function generateId() {
-    return crypto.randomUUID();
+    return crypto.randomUUID
+        ? crypto.randomUUID()
+        : crypto.randomBytes(16).toString("hex");
 }
 
-async function getUserById(id) {
-    try {
-        const { resources } = await usersContainer.items
-            .query("SELECT * FROM c WHERE c.id = @id", {
-                parameters: [{ name: "@id", value: id }],
-            })
-            .fetchAll();
-        return resources[0];
-    } catch (err) {
-        console.error("Error getting user:", err.message);
-        return null;
-    }
+// Fetch a single video doc by id using a query (ignores partition key)
+async function getVideoById(id) {
+    const querySpec = {
+        query: "SELECT * FROM c WHERE c.id = @id",
+        parameters: [{ name: "@id", value: id }]
+    };
+
+    const { resources } = await videosContainer.items.query(querySpec).fetchAll();
+    if (!resources || resources.length === 0) return null;
+    return resources[0];
 }
 
-async function createUser(user) {
-    try {
-        await usersContainer.items.create(user);
-    } catch (err) {
-        console.error("Error creating user:", err.message);
-    }
-}
+// ---------- Routes ----------
 
-// Routes
 app.get("/", (req, res) => {
     res.send("Video backend API is running");
 });
 
-// Get authenticated user data
-app.get("/api/auth/me", async (req, res) => {
-    try {
-        const user = await fetchAuthUser(req);
-        res.json(user);
-    } catch (err) {
-        console.error("Error fetching user data:", err.message);
-        res.status(500).json({ error: "Failed to fetch user data" });
-    }
-});
-
-// Fetch user from Azure's EasyAuth
-async function fetchAuthUser(req) {
-    const { data } = await fetch("/.auth/me", { credentials: "include" });
-    if (!Array.isArray(data) || data.length === 0) throw new Error("No user found");
-    const principal = data[0];
-    const userId = principal.user_id || principal.userDetails;
-
-    let user = await getUserById(userId);
-    if (!user) {
-        user = {
-            id: userId,
-            username: principal.userDetails,
-            displayName: principal.userDetails,
-            email: principal.email || "",
-        };
-        await createUser(user);
-    }
-
-    return user;
-}
-
-// Get all videos
+// LIST all videos
 app.get("/api/videos", async (req, res) => {
     try {
         const query = { query: "SELECT * FROM c ORDER BY c.createdAt DESC" };
@@ -124,7 +82,53 @@ app.get("/api/videos", async (req, res) => {
     }
 });
 
-// Upload a new video
+// GET single video by id
+app.get("/api/videos/:id", async (req, res) => {
+    const id = req.params.id;
+
+    try {
+        const video = await getVideoById(id);
+        if (!video) {
+            return res.status(404).json({ error: "Video not found" });
+        }
+
+        // Optional view counter
+        video.views = (video.views || 0) + 1;
+        const partitionKey = video.userId || video.id;
+
+        try {
+            await videosContainer.item(video.id, partitionKey).replace(video);
+        } catch (e) {
+            console.warn("Could not update views:", e.message);
+        }
+
+        res.json(video);
+    } catch (err) {
+        console.error("Error getting video:", err.message);
+        res.status(500).json({ error: "Failed to get video" });
+    }
+});
+
+// LIST videos for one user
+app.get("/api/users/:userId/videos", async (req, res) => {
+    const userId = req.params.userId;
+
+    try {
+        const query = {
+            query:
+                "SELECT * FROM c WHERE c.userId = @userId ORDER BY c.createdAt DESC",
+            parameters: [{ name: "@userId", value: userId }]
+        };
+
+        const { resources } = await videosContainer.items.query(query).fetchAll();
+        res.json(resources);
+    } catch (err) {
+        console.error("Error listing user videos:", err.message);
+        res.status(500).json({ error: "Failed to list user videos" });
+    }
+});
+
+// UPLOAD video: Blob + metadata in Cosmos
 app.post("/api/videos", upload.single("file"), async (req, res) => {
     try {
         await ensureBlobContainer();
@@ -133,14 +137,17 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
         const file = req.file;
 
         if (!title || !userId || !file) {
-            return res.status(400).json({ error: "title, userId, and file are required" });
+            return res
+                .status(400)
+                .json({ error: "title, userId and file are required" });
         }
 
-        const blobName = Date.now() + "-" + file.originalname.replace(/\s+/g, "_");
+        const safeName = file.originalname.replace(/\s+/g, "_");
+        const blobName = `${Date.now()}-${safeName}`;
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
         await blockBlobClient.uploadData(file.buffer, {
-            blobHTTPHeaders: { blobContentType: file.mimetype },
+            blobHTTPHeaders: { blobContentType: file.mimetype }
         });
 
         const blobUrl = blockBlobClient.url;
@@ -153,7 +160,7 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
             userId,
             blobUrl,
             createdAt: new Date().toISOString(),
-            views: 0,
+            views: 0
         };
 
         await videosContainer.items.create(newVideo);
@@ -165,38 +172,30 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
     }
 });
 
-// Get videos by userId
-app.get("/api/users/:userId/videos", async (req, res) => {
-    const userId = req.params.userId;
-
-    try {
-        const query = {
-            query: "SELECT * FROM c WHERE c.userId = @userId ORDER BY c.createdAt DESC",
-            parameters: [{ name: "@userId", value: userId }],
-        };
-        const { resources } = await videosContainer.items.query(query).fetchAll();
-        res.json(resources);
-    } catch (err) {
-        console.error("Error listing user videos:", err.message);
-        res.status(500).json({ error: "Failed to list user videos" });
-    }
-});
-
-// Video delete endpoint
+// DELETE video: remove Blob + metadata
 app.delete("/api/videos/:id", async (req, res) => {
     const id = req.params.id;
 
     try {
-        const { resource: video } = await videosContainer.item(id, id).read();
+        const video = await getVideoById(id);
         if (!video) {
             return res.status(404).json({ error: "Video not found" });
         }
 
-        const blobName = video.blobUrl.split("/").pop();
-        const blobClient = containerClient.getBlockBlobClient(blobName);
-        await blobClient.deleteIfExists();
+        // Delete blob
+        if (video.blobUrl) {
+            try {
+                const blobName = video.blobUrl.split("/").pop();
+                const blobClient = containerClient.getBlockBlobClient(blobName);
+                await blobClient.deleteIfExists();
+            } catch (blobErr) {
+                console.warn("Error deleting blob:", blobErr.message);
+            }
+        }
 
-        await videosContainer.item(id, id).delete();
+        // Delete Cosmos doc
+        const partitionKey = video.userId || video.id;
+        await videosContainer.item(video.id, partitionKey).delete();
 
         res.json({ status: "deleted" });
     } catch (err) {
@@ -205,7 +204,7 @@ app.delete("/api/videos/:id", async (req, res) => {
     }
 });
 
-// Start the server
+// ---------- Start ----------
 app.listen(port, () => {
     console.log(`Video backend API listening on port ${port}`);
 });
