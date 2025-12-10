@@ -1,9 +1,3 @@
-// server.js
-// Backend API for video sharing app using:
-// - Azure Blob Storage for video files
-// - Azure Cosmos DB (NoSQL) for metadata
-// - Express + multer for file upload
-
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -16,8 +10,9 @@ const app = express();
 const port = process.env.PORT || 4000;
 
 // ---------- Middleware ----------
-app.use(cors());               // allow frontend to call this API
-app.use(express.json());       // parse JSON bodies
+app.use(cors());               // Allow frontend to call this API
+app.use(express.json());       // Parse JSON bodies
+app.use(express.static("public")); // Serve static files (like images)
 
 // Multer in-memory storage for uploaded files
 const upload = multer({
@@ -28,10 +23,6 @@ const upload = multer({
 // ---------- Blob Storage Setup ----------
 const storageConnectionString = process.env.AZURE_STORAGE_CONNECTION_STRING;
 const blobContainerName = process.env.BLOB_CONTAINER_NAME || "videos";
-
-if (!storageConnectionString) {
-    console.warn("WARNING: AZURE_STORAGE_CONNECTION_STRING is not set");
-}
 
 const blobServiceClient = BlobServiceClient.fromConnectionString(
     storageConnectionString
@@ -53,10 +44,6 @@ const cosmosKey = process.env.COSMOS_KEY;
 const cosmosDbName = process.env.COSMOS_DB_NAME || "video-db";
 const cosmosContainerName = process.env.COSMOS_CONTAINER_NAME || "videos";
 
-if (!cosmosEndpoint || !cosmosKey) {
-    console.warn("WARNING: COSMOS_ENDPOINT or COSMOS_KEY not set");
-}
-
 const cosmosClient = new CosmosClient({
     endpoint: cosmosEndpoint,
     key: cosmosKey
@@ -64,16 +51,33 @@ const cosmosClient = new CosmosClient({
 
 const database = cosmosClient.database(cosmosDbName);
 const videosContainer = database.container(cosmosContainerName);
+const usersContainer = database.container("users"); // New "users" container
 
 // ---------- Helper functions ----------
-
-// Generate a unique ID for Cosmos documents
 function generateId() {
-    if (crypto.randomUUID) {
-        return crypto.randomUUID();
+    return crypto.randomUUID();
+}
+
+async function getUserById(id) {
+    try {
+        const { resources } = await usersContainer.items
+            .query("SELECT * FROM c WHERE c.id = @id", {
+                parameters: [{ name: "@id", value: id }],
+            })
+            .fetchAll();
+        return resources[0];
+    } catch (err) {
+        console.error("Error getting user:", err.message);
+        return null;
     }
-    // fallback for older Node versions
-    return crypto.randomBytes(16).toString("hex");
+}
+
+async function createUser(user) {
+    try {
+        await usersContainer.items.create(user);
+    } catch (err) {
+        console.error("Error creating user:", err.message);
+    }
 }
 
 // ---------- Routes ----------
@@ -83,13 +87,51 @@ app.get("/", (req, res) => {
     res.send("Video backend API is running");
 });
 
-// GET /api/videos  → list all videos (latest first)
+// GitHub authentication routes
+app.get("/auth/github", (req, res) => {
+    res.send("GitHub OAuth redirect here");
+});
+
+// ---------- Azure Authentication (EasyAuth) ----------
+
+// Get the authenticated user data from Azure EasyAuth
+app.get("/api/auth/me", async (req, res) => {
+    try {
+        const user = await fetchAuthUser(req);
+        res.json(user);
+    } catch (err) {
+        console.error("Error fetching user data:", err.message);
+        res.status(500).json({ error: "Failed to fetch user data" });
+    }
+});
+
+// Fetch the authenticated user from Azure's EasyAuth
+async function fetchAuthUser(req) {
+    const { data } = await fetch("/.auth/me", { credentials: "include" });
+    if (!Array.isArray(data) || data.length === 0) throw new Error("No user found");
+    const principal = data[0];
+    const userId = principal.user_id || principal.userDetails;
+
+    let user = await getUserById(userId);
+    if (!user) {
+        user = {
+            id: userId,
+            username: principal.userDetails,
+            displayName: principal.userDetails,
+            email: principal.email || '',
+        };
+        await createUser(user);
+    }
+
+    return user;
+}
+
+// GET /api/videos → List all videos (latest first)
 app.get("/api/videos", async (req, res) => {
     try {
         const query = {
             query: "SELECT * FROM c ORDER BY c.createdAt DESC"
         };
-
         const { resources } = await videosContainer.items.query(query).fetchAll();
         res.json(resources);
     } catch (err) {
@@ -98,46 +140,7 @@ app.get("/api/videos", async (req, res) => {
     }
 });
 
-// GET /api/videos/:id → get a single video by id
-app.get("/api/videos/:id", async (req, res) => {
-    const id = req.params.id;
-
-    try {
-        const { resource } = await videosContainer.item(id, id).read();
-        if (!resource) {
-            return res.status(404).json({ error: "Video not found" });
-        }
-        res.json(resource);
-    } catch (err) {
-        console.error("Error getting video:", err.message);
-        res.status(404).json({ error: "Video not found" });
-    }
-});
-
-// GET /api/users/:userId/videos → list videos uploaded by a specific user
-app.get("/api/users/:userId/videos", async (req, res) => {
-    const userId = req.params.userId;
-
-    try {
-        const query = {
-            query: "SELECT * FROM c WHERE c.userId = @userId ORDER BY c.createdAt DESC",
-            parameters: [{ name: "@userId", value: userId }]
-        };
-
-        const { resources } = await videosContainer.items.query(query).fetchAll();
-        res.json(resources);
-    } catch (err) {
-        console.error("Error listing user videos:", err.message);
-        res.status(500).json({ error: "Failed to list user videos" });
-    }
-});
-
-// POST /api/videos → upload a new video
-// Expect multipart/form-data with fields:
-// - title (string)
-// - description (string, optional)
-// - userId (string)
-// - file (video file)
+// POST /api/videos → Upload a new video
 app.post("/api/videos", upload.single("file"), async (req, res) => {
     try {
         await ensureBlobContainer();
@@ -149,17 +152,18 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
             return res.status(400).json({ error: "title, userId and file are required" });
         }
 
-        // Upload file to Blob Storage
+        // Upload the file to Azure Blob Storage
         const blobName = Date.now() + "-" + file.originalname.replace(/\s+/g, "_");
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
         await blockBlobClient.uploadData(file.buffer, {
-            blobHTTPHeaders: { blobContentType: file.mimetype }
+            blobHTTPHeaders: { blobContentType: file.mimetype },
         });
 
         const blobUrl = blockBlobClient.url;
         const id = generateId();
 
+        // Save metadata in Cosmos DB
         const newVideo = {
             id,
             title,
@@ -170,7 +174,6 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
             views: 0
         };
 
-        // Save metadata in Cosmos DB
         await videosContainer.items.create(newVideo);
 
         res.status(201).json(newVideo);
@@ -180,28 +183,60 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
     }
 });
 
-// DELETE /api/videos/:id → delete video + blob
+// GET /api/users/:userId/videos → List videos uploaded by a specific user
+app.get("/api/users/:userId/videos", async (req, res) => {
+    const userId = req.params.userId;
+
+    try {
+        const query = {
+            query: "SELECT * FROM c WHERE c.userId = @userId ORDER BY c.createdAt DESC",
+            parameters: [{ name: "@userId", value: userId }]
+        };
+        const { resources } = await videosContainer.items.query(query).fetchAll();
+        res.json(resources);
+    } catch (err) {
+        console.error("Error listing user videos:", err.message);
+        res.status(500).json({ error: "Failed to list user videos" });
+    }
+});
+
+// GET /api/videos/:id → Get a single video by ID
+app.get("/api/videos/:id", async (req, res) => {
+    const id = req.params.id;
+
+    try {
+        const { resource } = await videosContainer.item(id, id).read();
+        if (!resource) {
+            return res.status(404).json({ error: "Video not found" });
+        }
+
+        // Increment views count
+        resource.views += 1;
+        await videosContainer.item(id, id).replace(resource);
+
+        res.json(resource);
+    } catch (err) {
+        console.error("Error getting video:", err.message);
+        res.status(404).json({ error: "Video not found" });
+    }
+});
+
+// DELETE /api/videos/:id → Delete video + blob
 app.delete("/api/videos/:id", async (req, res) => {
     const id = req.params.id;
 
     try {
-        // Read the document first to get blob URL
         const { resource: video } = await videosContainer.item(id, id).read();
         if (!video) {
             return res.status(404).json({ error: "Video not found" });
         }
 
-        // Delete the blob
-        try {
-            const blobName = video.blobUrl.split("/").pop();
-            const blobClient = containerClient.getBlockBlobClient(blobName);
-            await blobClient.deleteIfExists();
-        } catch (blobErr) {
-            console.warn("Warning: error deleting blob:", blobErr.message);
-            // Continue even if blob delete fails, so data is cleaned up.
-        }
+        // Delete the blob from Blob Storage
+        const blobName = video.blobUrl.split("/").pop();
+        const blobClient = containerClient.getBlockBlobClient(blobName);
+        await blobClient.deleteIfExists();
 
-        // Delete the document from Cosmos
+        // Delete video metadata from Cosmos DB
         await videosContainer.item(id, id).delete();
 
         res.json({ status: "deleted" });
@@ -211,7 +246,7 @@ app.delete("/api/videos/:id", async (req, res) => {
     }
 });
 
-// ---------- Start server ----------
+// ---------- Start Server ----------
 app.listen(port, () => {
     console.log(`Video backend API listening on port ${port}`);
 });
