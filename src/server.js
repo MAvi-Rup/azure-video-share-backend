@@ -30,7 +30,13 @@ const blobServiceClient = BlobServiceClient.fromConnectionString(
 const containerClient = blobServiceClient.getContainerClient(blobContainerName);
 
 async function ensureBlobContainer() {
-    await containerClient.createIfNotExists();
+    const exists = await containerClient.exists();
+    if (!exists) {
+        await containerClient.create({
+            access: 'blob' // Public read access to blobs
+        });
+        console.log(`Container "${blobContainerName}" created with public blob access`);
+    }
 }
 
 // ---------- Cosmos DB ----------
@@ -70,6 +76,25 @@ app.get("/", (req, res) => {
     res.send("Video backend API is running");
 });
 
+// LIST all blobs in container (for debugging)
+app.get("/api/blobs/list", async (req, res) => {
+    try {
+        const blobs = [];
+        for await (const blob of containerClient.listBlobsFlat()) {
+            blobs.push({
+                name: blob.name,
+                url: `https://${blobServiceClient.accountName}.blob.core.windows.net/${blobContainerName}/${blob.name}`,
+                createdOn: blob.properties.createdOn,
+                size: blob.properties.contentLength
+            });
+        }
+        res.json(blobs);
+    } catch (err) {
+        console.error("Error listing blobs:", err.message);
+        res.status(500).json({ error: "Failed to list blobs" });
+    }
+});
+
 // LIST all videos
 app.get("/api/videos", async (req, res) => {
     try {
@@ -90,6 +115,15 @@ app.get("/api/videos/:id", async (req, res) => {
         const video = await getVideoById(id);
         if (!video) {
             return res.status(404).json({ error: "Video not found" });
+        }
+
+        // Verify blob still exists
+        if (video.blobName) {
+            const blobClient = containerClient.getBlobClient(video.blobName);
+            const exists = await blobClient.exists();
+            if (!exists) {
+                console.warn(`Blob ${video.blobName} not found for video ${id}`);
+            }
         }
 
         // Optional view counter
@@ -146,11 +180,19 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
         const blobName = `${Date.now()}-${safeName}`;
         const blockBlobClient = containerClient.getBlockBlobClient(blobName);
 
+        console.log("Uploading blob:", blobName);
+
         await blockBlobClient.uploadData(file.buffer, {
             blobHTTPHeaders: { blobContentType: file.mimetype }
         });
 
+        // Verify upload succeeded
+        const exists = await blockBlobClient.exists();
+        console.log("Blob exists after upload:", exists);
+
         const blobUrl = blockBlobClient.url;
+        console.log("Blob URL:", blobUrl);
+
         const id = generateId();
 
         const newVideo = {
@@ -159,6 +201,7 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
             description: description || "",
             userId,
             blobUrl,
+            blobName,
             createdAt: new Date().toISOString(),
             views: 0
         };
@@ -167,8 +210,8 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
 
         res.status(201).json(newVideo);
     } catch (err) {
-        console.error("Error uploading video:", err.message);
-        res.status(500).json({ error: "Upload failed" });
+        console.error("Error uploading video:", err.message, err.stack);
+        res.status(500).json({ error: "Upload failed", details: err.message });
     }
 });
 
@@ -182,12 +225,14 @@ app.delete("/api/videos/:id", async (req, res) => {
             return res.status(404).json({ error: "Video not found" });
         }
 
-        // Delete blob
-        if (video.blobUrl) {
+        // Delete blob using blobName if available, otherwise extract from URL
+        const blobName = video.blobName || (video.blobUrl ? video.blobUrl.split("/").pop() : null);
+
+        if (blobName) {
             try {
-                const blobName = video.blobUrl.split("/").pop();
                 const blobClient = containerClient.getBlockBlobClient(blobName);
                 await blobClient.deleteIfExists();
+                console.log("Deleted blob:", blobName);
             } catch (blobErr) {
                 console.warn("Error deleting blob:", blobErr.message);
             }
