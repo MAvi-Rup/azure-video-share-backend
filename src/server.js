@@ -94,21 +94,18 @@ app.get("/api/videos", async (req, res) => {
 });
 
 // GET /api/videos/:id → get a single video by id
-// Fetch videos uploaded by a specific user (userId from session)
-app.get("/api/users/:userId/videos", async (req, res) => {
-    const userId = req.params.userId;
+app.get("/api/videos/:id", async (req, res) => {
+    const id = req.params.id;
 
     try {
-        const query = {
-            query: "SELECT * FROM c WHERE c.userId = @userId ORDER BY c.createdAt DESC",
-            parameters: [{ name: "@userId", value: userId }]
-        };
-
-        const { resources } = await videosContainer.items.query(query).fetchAll();
-        res.json(resources);
+        const { resource } = await videosContainer.item(id, id).read();
+        if (!resource) {
+            return res.status(404).json({ error: "Video not found" });
+        }
+        res.json(resource);
     } catch (err) {
-        console.error("Error listing user videos:", err.message);
-        res.status(500).json({ error: "Failed to list user videos" });
+        console.error("Error getting video:", err.message);
+        res.status(404).json({ error: "Video not found" });
     }
 });
 
