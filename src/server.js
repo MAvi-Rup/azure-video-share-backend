@@ -44,10 +44,21 @@ async function ensureBlobContainer() {
 }
 
 // ---------- Cosmos DB Setup ----------
+// const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
+// const cosmosKey = process.env.COSMOS_KEY;
+// const cosmosDbName = process.env.COSMOS_DB_NAME || "video-db";
+// const cosmosContainerName = process.env.COSMOS_CONTAINER_NAME || "videos";
+
+
+// ---------- Cosmos DB Setup ----------
 const cosmosEndpoint = process.env.COSMOS_ENDPOINT;
 const cosmosKey = process.env.COSMOS_KEY;
 const cosmosDbName = process.env.COSMOS_DB_NAME || "video-db";
 const cosmosContainerName = process.env.COSMOS_CONTAINER_NAME || "videos";
+// NEW: separate container for comments
+const cosmosCommentsContainerName =
+    process.env.COSMOS_COMMENTS_CONTAINER_NAME || "comments";
+
 
 if (!cosmosEndpoint || !cosmosKey) {
     console.warn("WARNING: COSMOS_ENDPOINT or COSMOS_KEY not set");
@@ -58,8 +69,13 @@ const cosmosClient = new CosmosClient({
     key: cosmosKey
 });
 
+// const database = cosmosClient.database(cosmosDbName);
+// const videosContainer = database.container(cosmosContainerName);
+
 const database = cosmosClient.database(cosmosDbName);
 const videosContainer = database.container(cosmosContainerName);
+const commentsContainer = database.container(cosmosCommentsContainerName); // NEW
+
 
 // ---------- Helper functions ----------
 
@@ -70,6 +86,14 @@ function generateId() {
     }
     return crypto.randomBytes(16).toString("hex");
 }
+
+function generateId() {
+    if (crypto.randomUUID) {
+        return crypto.randomUUID();
+    }
+    return crypto.randomBytes(16).toString("hex");
+}
+
 
 // ---------- Routes ----------
 
@@ -92,6 +116,99 @@ app.get("/api/videos", async (req, res) => {
         res.status(500).json({ error: "Failed to list videos" });
     }
 });
+
+//route for comments 
+// ---------- Comment routes ----------
+
+// GET /api/videos/:videoId/comments → list comments for a video
+app.get("/api/videos/:videoId/comments", async (req, res) => {
+    const videoId = req.params.videoId;
+
+    try {
+        const query = {
+            query:
+                "SELECT * FROM c WHERE c.videoId = @videoId ORDER BY c.createdAt ASC",
+            parameters: [{ name: "@videoId", value: videoId }]
+        };
+
+        const { resources } = await commentsContainer.items.query(query).fetchAll();
+        res.json(resources);
+    } catch (err) {
+        console.error("Error listing comments:", err.message);
+        res.status(500).json({ error: "Failed to list comments" });
+    }
+});
+
+// POST /api/videos/:videoId/comments → add a new comment
+app.post("/api/videos/:videoId/comments", async (req, res) => {
+    const videoId = req.params.videoId;
+    const { userId, userName, text } = req.body;
+
+    if (!userId || !text) {
+        return res
+            .status(400)
+            .json({ error: "userId and text are required for comments" });
+    }
+
+    try {
+        const id = generateId();
+        const newComment = {
+            id,
+            videoId,
+            userId,
+            userName: userName || userId,
+            text,
+            createdAt: new Date().toISOString()
+        };
+
+        await commentsContainer.items.create(newComment);
+        res.status(201).json(newComment);
+    } catch (err) {
+        console.error("Error creating comment:", err.message);
+        res.status(500).json({ error: "Failed to create comment" });
+    }
+});
+
+// DELETE /api/videos/:videoId/comments/:commentId → delete own comment
+app.delete(
+    "/api/videos/:videoId/comments/:commentId",
+    async (req, res) => {
+        const videoId = req.params.videoId;
+        const commentId = req.params.commentId;
+
+        // We trust the frontend to send x-user-id from the logged-in user
+        const currentUserId = req.headers["x-user-id"];
+
+        if (!currentUserId) {
+            return res.status(401).json({
+                error: "Missing x-user-id header"
+            });
+        }
+
+        try {
+            const { resource: comment } = await commentsContainer
+                .item(commentId, commentId) // partition key = /id
+                .read();
+
+            if (!comment || comment.videoId !== videoId) {
+                return res.status(404).json({ error: "Comment not found" });
+            }
+
+            if (comment.userId !== currentUserId) {
+                return res
+                    .status(403)
+                    .json({ error: "You can only delete your own comment" });
+            }
+
+            await commentsContainer.item(commentId, commentId).delete();
+            res.json({ status: "deleted" });
+        } catch (err) {
+            console.error("Error deleting comment:", err.message);
+            res.status(500).json({ error: "Failed to delete comment" });
+        }
+    }
+);
+
 
 // GET /api/videos/:id → get a single video by id
 // Fetch videos uploaded by a specific user (userId from session)
@@ -156,6 +273,7 @@ app.post("/api/videos", upload.single("file"), async (req, res) => {
 });
 
 // DELETE /api/videos/:id → delete video + blob
+// DELETE /api/videos/:id → delete video + blob + its comments
 app.delete("/api/videos/:id", async (req, res) => {
     const id = req.params.id;
 
@@ -173,6 +291,27 @@ app.delete("/api/videos/:id", async (req, res) => {
             await blobClient.deleteIfExists();
         } catch (blobErr) {
             console.warn("Warning: error deleting blob:", blobErr.message);
+        }
+
+        // Delete all comments for this video
+        try {
+            const query = {
+                query: "SELECT * FROM c WHERE c.videoId = @videoId",
+                parameters: [{ name: "@videoId", value: id }]
+            };
+
+            const { resources: comments } = await commentsContainer.items
+                .query(query)
+                .fetchAll();
+
+            for (const comment of comments) {
+                await commentsContainer.item(comment.id, comment.id).delete();
+            }
+        } catch (commentsErr) {
+            console.warn(
+                "Warning: error deleting comments for video:",
+                commentsErr.message
+            );
         }
 
         // Delete the document from Cosmos
